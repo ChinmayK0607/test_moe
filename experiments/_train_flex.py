@@ -426,9 +426,9 @@ class GPT(nn.Module):
             window_mask = q_idx - kv_idx < 1024
             return causal_mask & document_mask & window_mask
 
-        S = len(idx[1])
-        block_mask = create_block_mask(document_causal_mask, None, None, S, S, device="cuda", _compile=False)
         B, T = idx.size()
+        S = T
+        block_mask = create_block_mask(document_causal_mask, None, None, S, S, device="cuda", _compile=False)
         assert T <= self.config.block_size, f"Sequence length {T} exceeds block size {self.config.block_size}"
         # Token embeddings and embed norm.
         x = self.transformer.wte(idx)
