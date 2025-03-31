@@ -28,6 +28,7 @@ class GPTConfig:
     dropout: int = 0.2
     num_experts: int = 8
     top_k: int = 2
+    capacity_factor: float = 1.0
 
 # Helper Functions
 def rms_norm(x, dim=-1, eps=1e-6):
@@ -68,13 +69,28 @@ class CausalSelfAttention(nn.Module):
         self.c_proj.weight.data.zero_()
         self.rotary = Rotary(self.head_dim)
         self.lamb = nn.Parameter(torch.tensor(0.5))
+        
+    def to_float16(self):
+        """Convert model parameters to float16"""
+        self.c_attention.weight.data = self.c_attention.weight.data.half()
+        if self.c_attention.bias is not None:
+            self.c_attention.bias.data = self.c_attention.bias.data.half()
+        self.c_proj.weight.data = self.c_proj.weight.data.half()
+        if self.c_proj.bias is not None:
+            self.c_proj.bias.data = self.c_proj.bias.data.half()
 
     def forward(self, x, v1=None, mask_mod=None):
         B, T, C = x.size()
+        
+        # Keep track of input dtype for autocast
+        input_dtype = x.dtype
+        
+        # QKV projection
         qkv = self.c_attention(x)
         q, k, v = qkv.split(self.n_embed, dim=2)
+        
         query = q.view(B, T, self.n_head, self.head_dim).transpose(1, 2)
-        key   = k.view(B, T, self.n_head, self.head_dim).transpose(1, 2)
+        key = k.view(B, T, self.n_head, self.head_dim).transpose(1, 2)
         value = v.view(B, T, self.n_head, self.head_dim).transpose(1, 2)
         
         if v1 is None:
@@ -83,30 +99,30 @@ class CausalSelfAttention(nn.Module):
             v1 = v1.view_as(value)
         value = (1 - self.lamb) * value + self.lamb * v1
         
-        # Ensure consistent FP16 dtype
-        query = query.to(torch.float16)
-        key   = key.to(torch.float16)
-        value = value.to(torch.float16)
-        
         query = rms_norm(query, dim=-1)
-        key   = rms_norm(key, dim=-1)
+        key = rms_norm(key, dim=-1)
         cos, sin = self.rotary(query)
         query = apply_rotary_emb(query, cos, sin)
-        key   = apply_rotary_emb(key, cos, sin)
-        value = value.to(torch.float32)
+        key = apply_rotary_emb(key, cos, sin)
+        
         if mask_mod is None:
             mask_mod = causal_mask
         block_mask = create_block_mask(mask_mod, B, self.n_head, T, T, device=x.device)
         scale = 1 / (self.head_dim ** 0.5)
         
-        # Logging FlexAttention usage
-        print(f"[FlexAttention] Entering flex_attention - Query shape: {query.shape}, "
-              f"Key shape: {key.shape}, Value shape: {value.shape}")
-        attn_output = flex_attention(query, key, value, block_mask=block_mask, scale=scale)
-        print("[FlexAttention] Exiting flex_attention")
+        # Ensure same dtype for flex_attention
+        flex_dtype = torch.float16 if torch.is_autocast_enabled() else torch.float32
+        query = query.to(flex_dtype)
+        key = key.to(flex_dtype)
+        value = value.to(flex_dtype)
         
+        attn_output = flex_attention(query, key, value, block_mask=block_mask, scale=scale)
+        
+        # Convert back to input dtype
+        attn_output = attn_output.to(input_dtype)
         attn_output = attn_output.transpose(1, 2).contiguous().view(B, T, C)
         attn_output = self.c_proj(attn_output)
+        
         return attn_output, value
 
 class RMSNorm(nn.Module):
@@ -117,13 +133,71 @@ class RMSNorm(nn.Module):
     def forward(self, x):
         return rms_norm(x, dim=-1) * self.scale
 
+class ReLUSquared(nn.Module):
+    def forward(self, x):
+        return F.relu(x).square()
+
+class Expert(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(config.n_embed, 4 * config.n_embed),
+            ReLUSquared(),
+            nn.Linear(4 * config.n_embed, config.n_embed),
+            nn.Dropout(config.dropout),
+        )
+    def forward(self, x):
+        return self.net(x)
+
+class NoisyTopkRouter(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        self.top_k = config.top_k
+        self.topkroute_linear = nn.Linear(config.n_embed, config.num_experts)
+        self.noise_linear = nn.Linear(config.n_embed, config.num_experts)
+    def forward(self, x):
+        logits = self.topkroute_linear(x)
+        noise_logits = self.noise_linear(x)
+        noise = torch.randn_like(logits) * F.softplus(noise_logits)
+        noisy_logits = logits + noise
+        top_k_logits, indices = noisy_logits.topk(self.top_k, dim=-1)
+        zeros = torch.full_like(noisy_logits, float('-inf'))
+        sparse_logits = zeros.scatter(-1, indices, top_k_logits)
+        router_output = F.softmax(sparse_logits, dim=-1)
+        return router_output
+
 class SparseMoE(nn.Module):
     def __init__(self, config):
         super().__init__()
-        self.dummy = nn.Linear(config.n_embed, config.n_embed)
-
+        self.router = NoisyTopkRouter(config)
+        self.experts = nn.ModuleList([Expert(config) for _ in range(config.num_experts)])
+        self.top_k = config.top_k
+        self.capacity_factor = config.capacity_factor
+        self.num_experts = config.num_experts
     def forward(self, x):
-        return self.dummy(x)  # Placeholder for actual MoE implementation
+        B, T, C = x.shape
+        gating_output = self.router(x)
+        final_output = torch.zeros_like(x)
+        flat_x = x.view(-1, C)
+        flat_gating_output = gating_output.view(-1, self.num_experts)
+        tokens_per_batch = B * T * self.top_k
+        expert_capacity = int((tokens_per_batch / self.num_experts) * self.capacity_factor)
+        updates = torch.zeros_like(flat_x)
+        for i, expert in enumerate(self.experts):
+            expert_mask = (gating_output.argmax(dim=-1) == i)
+            flat_mask = expert_mask.view(-1)
+            selected_indices = torch.nonzero(flat_mask).squeeze(-1)
+            limited_indices = (selected_indices[:expert_capacity]
+                               if selected_indices.numel() > expert_capacity
+                               else selected_indices)
+            if limited_indices.numel() > 0:
+                expert_input = flat_x[limited_indices]
+                expert_output = expert(expert_input)
+                gating_scores = flat_gating_output[limited_indices, i].unsqueeze(1)
+                weighted_output = expert_output * gating_scores
+                updates.index_add_(0, limited_indices, weighted_output)
+        final_output += updates.view(B, T, C)
+        return final_output
 
 class Block(nn.Module):
     def __init__(self, config):
@@ -169,6 +243,25 @@ class GPT(nn.Module):
             std = 0.02
             torch.nn.init.normal_(module.weight, mean=0.0, std=std)
 
+    def to(self, *args, **kwargs):
+        # Override to method to ensure consistent dtype
+        super().to(*args, **kwargs)
+        if len(args) > 0 and isinstance(args[0], torch.dtype):
+            dtype = args[0]
+        elif 'dtype' in kwargs:
+            dtype = kwargs['dtype']
+        else:
+            return self
+            
+        def convert_weights(m):
+            if isinstance(m, nn.Linear):
+                m.weight.data = m.weight.data.to(dtype)
+                if m.bias is not None:
+                    m.bias.data = m.bias.data.to(dtype)
+                    
+        self.apply(convert_weights)
+        return self
+
     def forward(self, idx, targets):
         B, T = idx.size()
         assert T <= self.config.block_size, f"Sequence length {T} exceeds block size {self.config.block_size}"
@@ -201,27 +294,28 @@ class GPT(nn.Module):
 
     def generate(self, idx, max_new_tokens):
         self.eval()
-        for _ in range(max_new_tokens):
-            idx_cond = idx[:, -self.config.block_size:]
-            x = self.transformer.wte(idx_cond)
-            x = self.embed_norm(x)
-            x0 = x
-            v1 = None
-            skip_connections = []
-            for i in range(self.encoder_layers):
-                x, v1 = self.transformer.h[i](x, x0, v1)
-                skip_connections.append(x)
-            for i in range(self.decoder_layers):
-                skip = skip_connections.pop()
-                weighted_skip = self.skip_weights[i] * skip
-                x, v1 = self.transformer.h[self.encoder_layers + i](x + weighted_skip, x0, v1)
-            x = self.transformer.norm_f(x)
-            logits = self.lm_head(x)
-            logits = 30 * torch.tanh(logits / 30)
-            logits_last = logits[:, -1, :]
-            probs = F.softmax(logits_last, dim=-1)
-            next_token = torch.multinomial(probs, num_samples=1)
-            idx = torch.cat((idx, next_token), dim=1)
+        with torch.no_grad(), torch.amp.autocast(device_type='cuda', dtype=torch.float16, enabled=(idx.device.type=="cuda")):
+            for _ in range(max_new_tokens):
+                idx_cond = idx[:, -self.config.block_size:]
+                x = self.transformer.wte(idx_cond)
+                x = self.embed_norm(x)
+                x0 = x
+                v1 = None
+                skip_connections = []
+                for i in range(self.encoder_layers):
+                    x, v1 = self.transformer.h[i](x, x0, v1)
+                    skip_connections.append(x)
+                for i in range(self.decoder_layers):
+                    skip = skip_connections.pop()
+                    weighted_skip = self.skip_weights[i] * skip
+                    x, v1 = self.transformer.h[self.encoder_layers + i](x + weighted_skip, x0, v1)
+                x = self.transformer.norm_f(x)
+                logits = self.lm_head(x)
+                logits = 30 * torch.tanh(logits / 30)
+                logits_last = logits[:, -1, :]
+                probs = F.softmax(logits_last, dim=-1)
+                next_token = torch.multinomial(probs, num_samples=1)
+                idx = torch.cat((idx, next_token), dim=1)
         self.train()
         return idx
 
@@ -328,7 +422,8 @@ if __name__ == "__main__":
 
     config = GPTConfig()
     model = GPT(config)
-    model.to(device)
+    model = model.to(device)
+    model = model.to(torch.float32)  # Keep model in float32 for training
     scaler = torch.amp.GradScaler('cuda')
     model = torch.compile(model)
 
@@ -347,11 +442,17 @@ if __name__ == "__main__":
             iter_start = time.time()
             x, y = train_loader.next_batch()
             x, y = x.to(device), y.to(device)
+            
             optimizer.zero_grad(set_to_none=True)
             
+            # Use autocast for forward pass
             with torch.amp.autocast(device_type=device, dtype=torch.float16, enabled=(device=="cuda")):
                 logits, loss = model(x, y)
+            
+            # Scale loss and compute gradients
             scaler.scale(loss).backward()
+            
+            # Unscale gradients and step optimizer
             scaler.step(optimizer)
             scaler.update()
             
